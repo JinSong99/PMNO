@@ -1,0 +1,547 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.autograd import Variable
+from torch.optim import lr_scheduler
+from torch.optim.lr_scheduler import StepLR
+import numpy as np
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+import scipy.io as scio
+import time
+import os
+import torch.nn.init as init
+from mpl_toolkits.mplot3d import Axes3D
+import scipy.io
+import plotly.graph_objects as go
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+torch.set_default_dtype(torch.float32)
+
+torch.manual_seed(66)
+np.random.seed(66)
+
+
+class ModifiedMLP(nn.Module):
+    def __init__(self, layers, activation):
+        super().__init__()
+        self.activation = activation
+
+        # 初始化 U1, U2 参数
+        self.U1 = nn.Parameter(torch.Tensor(layers[0], layers[1]))
+        self.b1 = nn.Parameter(torch.Tensor(layers[1]))
+        self.U2 = nn.Parameter(torch.Tensor(layers[0], layers[1]))
+        self.b2 = nn.Parameter(torch.Tensor(layers[1]))
+
+        # 创建中间线性层
+        self.linears = nn.ModuleList()
+        for i in range(len(layers) - 1):
+            in_dim = layers[i]
+            out_dim = layers[i + 1]
+            self.linears.append(nn.Linear(in_dim, out_dim))
+
+        # 初始化参数
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # 初始化 U1, U2 使用 Xavier 正态分布
+        init.xavier_normal_(self.U1)
+        init.zeros_(self.b1)
+        init.xavier_normal_(self.U2)
+        init.zeros_(self.b2)
+
+        # 初始化线性层参数
+        for linear in self.linears:
+            init.xavier_normal_(linear.weight)
+            init.zeros_(linear.bias)
+
+    def forward(self, x):
+        U = self.activation(torch.matmul(x, self.U1) + self.b1)
+        V = self.activation(torch.matmul(x, self.U2) + self.b2)
+
+        # 处理中间层（最后一层之前的所有层）
+        for linear in self.linears[:-1]:
+            x = self.activation(linear(x))
+            x = x * U + (1 - x) * V  # 混合操作
+
+        # 处理最后一层（无激活函数）
+        x = self.linears[-1](x)
+        return x
+
+
+class SinAct(nn.Module):
+    def __init__(self):
+        super(SinAct, self).__init__()
+
+    def forward(self, x):
+        return torch.sin(x)
+
+
+class CNN(nn.Module):
+    """卷积网络处理函数输入(如图像)"""
+
+    def __init__(self, dt, k, input_channels=2, input_kernel_size=5, output_dim=2, width=3):
+        super().__init__()
+        padding = (input_kernel_size - 1) // 2
+        self.conv_layers = nn.Sequential(
+            # 输入形状: (batch_size, input_channels, 64, 64)
+            nn.Conv3d(input_channels, input_channels, kernel_size=input_kernel_size, padding=padding),
+            nn.Tanh(),
+        )
+
+        self.fc = nn.Sequential(
+            nn.Linear(width ** 3, output_dim),
+        )
+        self.kweights = nn.Parameter(torch.Tensor(k, 1))
+
+        torch.nn.init.xavier_normal_(self.kweights)
+        self._initialize_weights()  # 初始化网络权重
+
+        self.dt = dt
+
+    def _initialize_weights(self):
+        # 对卷积层权重和偏置进行初始化
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # 使用 Xavier 正态分布初始化权重
+                init.xavier_normal_(m.weight)
+                m.weight.data = 0.02 * m.weight.data
+                # 将偏置初始化为零
+                if m.bias is not None:
+                    init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                # 对全连接层使用 Xavier 正态分布初始化权重
+                init.xavier_normal_(m.weight)
+                # 将偏置初始化为零
+                if m.bias is not None:
+                    init.zeros_(m.bias)
+
+    def forward(self, x):
+        # x形状: (batch_size, C, H, W)
+        x1 = self.conv_layers(x)
+        x = (self.kweights.view(5, 1, 1, 1, 1) * (self.dt * x1 + x)).sum(dim=0)
+
+        return self.fc(x.reshape(2, -1))  # 输出形状: (batch_size, m)
+
+
+class RCNNCell(nn.Module):
+    ''' Recurrent convolutional neural network Cell '''
+
+    def __init__(self, k, trunk_layers, width, dt, input_channels, input_kernel_size, output_dim):
+        super(RCNNCell, self).__init__()
+
+        self.CNN = CNN(dt, k, input_channels, input_kernel_size, output_dim, width)
+        self.trunk_net = ModifiedMLP(trunk_layers, SinAct())
+        self.p = output_dim
+
+    def forward(self, h, y):
+        # periodic padding, can also be achieved using 'circular' padding
+        B = self.CNN(h)
+        T = self.trunk_net(y)
+        outputs = 1 / self.p * torch.matmul(T, B.T)
+        # outputs = torch.sin(outputs)
+
+        return outputs
+
+
+class RCNN(nn.Module):
+    ''' Recurrent convolutional neural network layer '''
+
+    def __init__(self, k, trunk_layers, width, dt, output_dim, input_channels, input_kernel_size, init_h0, x, truth,
+                 step=1, effective_step=[1]):
+
+        super(RCNN, self).__init__()
+
+        # input channels of layer includes input_channels and hidden_channels of cells
+        self.init_h0 = init_h0
+        self.k = k
+        self.x = x
+        self.truth = truth
+        self.step = step
+        self.effective_step = effective_step
+        self._all_layers = []
+
+        name = 'crnn_cell'
+        cell = RCNNCell(
+            k=k,
+            trunk_layers=trunk_layers,
+            width=width,
+            dt=dt,
+            input_channels=input_channels,
+            input_kernel_size=input_kernel_size,
+            output_dim=output_dim)
+
+        setattr(self, name, cell)
+        self._all_layers.append(cell)
+
+    def forward(self, y):
+
+        internal_state = []
+        loss_t = []
+
+        for step in range(self.step - self.k):
+            name = 'crnn_cell'
+            # all cells are initialized in the first step
+            if step == 0:
+                h = self.init_h0
+                internal_state = h
+
+            # forward
+            h = internal_state
+            # hidden state + output
+            o = getattr(self, name)(h, y)
+            loss = ((o - self.truth[step].T) ** 2).mean().unsqueeze(0).unsqueeze(0)
+
+            h1 = getattr(self, name)(h, self.x)  # m*1
+            internal_state = torch.cat((internal_state[1:], self.transform(h1)), dim=0)
+
+            # after many layers output the result save at time step t
+            if step in self.effective_step:
+                loss_t.append(loss)
+
+        return loss_t
+
+    def transform(self, h):
+        channel_0 = h[:, 0:1]  # 提取第一个通道 (16384, 1)
+        channel_1 = h[:, 1:2]  # 提取第二个通道 (16384, 1)
+
+        reshaped_0 = channel_0.view(32, 32, 32)  # 第一个通道 (128, 128)
+        reshaped_1 = channel_1.view(32, 32, 32)  # 第二个通道 (128, 128)
+
+        stacked_tensor = torch.stack([reshaped_0, reshaped_1], dim=0)  # 沿通道维度堆叠
+        final_tensor = stacked_tensor.unsqueeze(0)  # 或 stacked_tensor[None, ...]
+
+        return final_tensor
+
+    def test(self, y):
+
+        internal_state = []
+        outputs_u = []
+        outputs_v = []
+
+        for step in range(self.step - self.k):
+            name = 'crnn_cell'
+            # all cells are initialized in the first step
+            if step == 0:
+                h = self.init_h0
+                internal_state = h
+
+            # forward
+            h = internal_state
+            # hidden state + output
+            o = getattr(self, name)(h, y)
+
+            h1 = getattr(self, name)(h, self.x)  # m*1
+            internal_state = torch.cat((internal_state[1:], self.transform(h1)), dim=0)
+
+            # after many layers output the result save at time step t
+            if step in self.effective_step:
+                outputs_u.append(o[:, 0:1])
+                outputs_v.append(o[:, 1:2])
+
+        return outputs_u, outputs_v
+
+
+def train(model, y, n_iters, learning_rate, cont=True):
+    if cont:
+        model, optimizer, scheduler, train_loss_list = load_model(model)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        scheduler = StepLR(optimizer, step_size=200, gamma=0.99)
+        train_loss_list = []
+
+    # for param_group in optimizer.param_groups:
+    #    param_group['lr']=0.0012
+
+    M = torch.triu(torch.ones(length, length), diagonal=1).cuda()
+
+    for epoch in range(n_iters):
+        # input: [time,. batch, channel, height, width]
+        optimizer.zero_grad()
+        # One single batch
+        loss_t = model(y)  # output is a list
+        loss_t = torch.cat(tuple(loss_t), dim=1)  # N*(T-k)
+
+        W = torch.exp(-500 * (loss_t @ M)).detach()
+        loss_w = 1000 * (W * loss_t).mean()
+        loss = loss_t.mean()
+
+        loss_w.backward(retain_graph=True)
+        optimizer.step()
+        scheduler.step()
+        # print loss in each epoch
+        print('[%d/%d %d%%] loss: %.7f, wloss: %.7f' % (
+        (epoch + 1), n_iters, ((epoch + 1) / n_iters * 100.0), loss.item(), loss_w.item()))
+        train_loss_list.append(loss.item())
+        # Save checkpoint
+        if (epoch + 1) % 100 == 0:
+            for param_group in optimizer.param_groups:
+                print(param_group['lr'])
+            print('save model at {}'.format(epoch + 1))
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss_list': train_loss_list,
+            }, './3D GS/data driven/model/checkpoint_deeponet.pt')
+    return train_loss_list
+
+
+def save_model(model, model_name, save_path):
+    ''' save the model '''
+    torch.save(model.state_dict(), save_path + model_name + '.pt')
+
+
+def load_model(model):
+    # Load model and optimizer state
+    checkpoint = torch.load('./3D GS/data driven/model/checkpoint_deeponet.pt')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer = optim.Adam(model.parameters(), lr=0.0)
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.99)
+    train_loss_list = checkpoint['train_loss_list']
+    return model, optimizer, scheduler, train_loss_list
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+
+def postprocess3D(data, x, y, z, isU=True, flag=None, num=None, t=None):
+
+    appd = ['Prediction', 'Truth', 'Error']
+    uv = ['v', 'u']
+    values = data
+
+    fig = go.Figure(data=go.Isosurface(
+        x=x.flatten(),
+        y=y.flatten(),
+        z=z.flatten(),
+        value=values.flatten(),
+        isomin=0.3 if isU else 0.1,
+        isomax=0.5 if isU else 0.2,
+        opacity=0.2,
+        colorscale='RdBu' if isU else 'RdGy',  # 'RdBu', 'RdGy'
+        surface_count=3,  # number of isosurfaces, 2 by default: only min and max
+    ))
+
+    fig.update_layout(
+        # title='3D Isosurface',
+        # title_font=dict(size=24, family='Arial', color='black'),  # 标题字体
+        # font=dict(size=14, family='Arial'),  # 全局默认字体
+        width=800,
+        height=800,
+        # margin=dict(l=100, r=100, t=100, b=100),
+        scene_camera=dict(
+            eye=dict(x=1.2, y=1.2, z=1.5)  # 调整 z 使主体上移
+        ),
+
+        scene=dict(
+            xaxis=dict(
+                title='X',
+                title_font=dict(size=20, family='Arial', color='black'),  # X轴标题
+                tickfont=dict(size=18, family='Arial')  # X轴刻度字体
+            ),
+            yaxis=dict(
+                title='Y',
+                title_font=dict(size=20, family='Arial', color='black'),  # Y轴标题
+                tickfont=dict(size=18, family='Arial')
+            ),
+            zaxis=dict(
+                title='Z',
+                title_font=dict(size=20, family='Arial', color='black'),  # Z轴标题
+                tickfont=dict(size=18, family='Arial')
+            ),
+
+        )
+    )
+
+    # fig.show()
+    fig.write_image('./3D GS/figures/deeponet/Iso_surf_deeponet_%s_%s_%.2f.png' % (uv[isU], appd[flag], t[num]), engine='orca', scale=2)
+    plt.close('all')
+
+def postprocess3D_error(data, x, y, z, isU=True, flag=None, num=None, t=None):
+
+    appd = ['Prediction', 'Truth', 'Error']
+    uv = ['v', 'u']
+    values = data
+
+    fig = go.Figure(data=go.Isosurface(
+        x=x.flatten(),
+        y=y.flatten(),
+        z=z.flatten(),
+        value=values.flatten(),
+        isomin=0.003,
+        isomax=0.03,
+        opacity=0.2,
+        colorscale='YlGnBu',
+        surface_count=3,  # number of isosurfaces, 2 by default: only min and max
+    ))
+
+    fig.update_layout(
+        # title='3D Isosurface',
+        # title_font=dict(size=24, family='Arial', color='black'),  # 标题字体
+        # font=dict(size=14, family='Arial'),  # 全局默认字体
+        width=800,
+        height=800,
+        # margin=dict(l=100, r=100, t=100, b=100),
+        scene_camera=dict(
+            eye=dict(x=1.2, y=1.2, z=1.5)  # 调整 z 使主体上移
+        ),
+
+        scene=dict(
+            xaxis=dict(
+                title='X',
+                title_font=dict(size=20, family='Arial', color='black'),  # X轴标题
+                tickfont=dict(size=18, family='Arial')  # X轴刻度字体
+            ),
+            yaxis=dict(
+                title='Y',
+                title_font=dict(size=20, family='Arial', color='black'),  # Y轴标题
+                tickfont=dict(size=18, family='Arial')
+            ),
+            zaxis=dict(
+                title='Z',
+                title_font=dict(size=20, family='Arial', color='black'),  # Z轴标题
+                tickfont=dict(size=18, family='Arial')
+            ),
+
+        )
+    )
+
+    # fig.show()
+    fig.write_image('./3D GS/figures/deeponet/Iso_surf_deeponet_%s_%s_%.2f.png' % (uv[isU], appd[flag], t[num]), engine='orca', scale=2)
+    plt.close('all')
+
+if __name__ == '__main__':
+    # 加载数据
+    uv_sol = scipy.io.loadmat('./data/3DGS.mat')['UV']  # (301,2,32,32,32)
+    t = np.linspace(0, 300 * 0.2, 301)  # (301,)
+
+
+    sub = 2
+    uv_sol = uv_sol[::sub]
+    t = t[::sub]
+
+    Lx, Ly, Lz = 80, 80, 80
+    Nx, Ny, Nz = 32, 32, 32
+    dx = Lx / Nx  # 空间步长
+    dy = Ly / Ny  # 空间步长
+    dz = Lz / Nz  # 空间步长
+    x = np.linspace(-Lx / 2, Lx / 2, Nx, endpoint=False)
+    y = np.linspace(-Ly / 2, Ly / 2, Ny, endpoint=False)
+    z = np.linspace(-Lz / 2, Lz / 2, Nz, endpoint=False)
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    X_all = np.stack((X, Y, Z), axis=-1).reshape(-1, 3)
+
+
+    # Adaptive Sample
+    N = 18000
+    distances = np.sqrt((X.flatten() - 0) ** 2 + (Y.flatten() - 0) ** 2 + (Z.flatten() - 0) ** 2)
+    weights = 1 / (distances + 1e-6)  # 加小常数避免除零
+    # indices = np.random.choice(len(X.flatten()), size=N, p=weights / weights.sum(), replace=False)
+    indices = np.random.choice(len(X.flatten()), size=N, replace=False)
+    x = X_all[indices]
+
+    # 假设以下是你为模型提供的输入参数
+    k = 5  # num of input u
+
+    U0 = uv_sol[:k, :, :, :, :]  # [k,2,32,32,32]
+    width = U0.shape[-1]
+    d = 3  # 维数
+
+    length = 40
+    step = k + length  # 时间步长
+    effective_step = list(range(0, step))
+
+    dt = t[1] - t[0]
+    x_values = X_all
+    y_values = x
+    U = uv_sol[:step].reshape(step, 2, -1)  # [201, 2, 32*32*32]
+    truth = U[k:, :, indices]
+    truth = torch.tensor(truth, dtype=torch.float32).cuda()
+    ################# build the model #####################
+    # define the mdel hyperparameters
+
+    # 创建初始化的隐藏状态 (k * m)
+    init_h0 = torch.tensor(U0, dtype=torch.float32).cuda()
+
+    # 创建 x 和 y 输入数据
+    x = torch.tensor(x_values, dtype=torch.float32).cuda()  # m * d 的输入
+    y = torch.tensor(y_values, dtype=torch.float32).cuda()  # N * d 的输入
+
+    output_dim = 100
+    model = RCNN(
+        k=k,
+        trunk_layers=[3, 100, 100, output_dim],  # 输入为 d，输出为 100
+        width=width,
+        dt=dt,
+        output_dim=output_dim,
+        input_channels=2,
+        input_kernel_size=5,
+        init_h0=init_h0,
+        x=x,
+        truth=truth,
+        step=step,
+        effective_step=effective_step).cuda()
+
+    n_iters = 0
+    learning_rate = 1e-3
+    # train the model
+    start = time.time()
+    cont = True  # if continue training (or use pretrained model), set cont=True
+    train_loss_list = train(model, y, n_iters, learning_rate, cont=cont)
+    end = time.time()
+
+    print('The training time is: ', (end - start))
+
+
+    # Do the forward inference
+    with torch.no_grad():
+        output_u, output_v = model.test(x)
+    output_u = torch.cat(tuple(output_u), dim=1).T
+    output_v = torch.cat(tuple(output_v), dim=1).T
+    truth = U[k:, :, :]
+
+    truth_u = truth[:, 0, :]
+    truth_v = truth[:, 1, :]
+    truth_u = truth_u.reshape(length, 32, 32, 32)
+    truth_v = truth_v.reshape(length, 32, 32, 32)
+
+    output_u = output_u.reshape(length, 32, 32, 32).cpu().detach().numpy()
+    output_v = output_v.reshape(length, 32, 32, 32).cpu().detach().numpy()
+
+    L_e = np.mean(np.sqrt((output_u - truth_u) ** 2 + (output_v - truth_v) ** 2), axis=(1, 2, 3))
+    L = np.mean(np.sqrt(truth_u ** 2 + truth_v ** 2), axis=(1, 2, 3))
+    Lv_e = np.mean(np.sqrt((output_v - truth_v) ** 2), axis=(1, 2, 3))
+    Lv = np.mean(np.sqrt(truth_v ** 2), axis=(1, 2, 3))
+
+    erroru = L_e / L
+    errorv = Lv_e / Lv
+    plt.plot(erroru)
+    plt.plot(errorv)
+    plt.show()
+    #
+    output = np.sqrt(output_u ** 2 + output_v ** 2)
+    truth = np.sqrt(truth_u ** 2 + truth_v ** 2)
+    L_e = np.mean(np.sqrt((output - truth) ** 2), axis=(1, 2, 3))
+    L = np.mean(np.sqrt(truth ** 2), axis=(1, 2, 3))
+
+    t = t[k:k + length]
+    error = L_e / L
+    plt.plot(t, error)
+    plt.show()
+
+
+    postprocess3D(output_v[-1], X, Y, Z, isU=False, flag=0, num=-1, t=t)
+    postprocess3D(truth_v[-1], X, Y, Z, isU=False, flag=1, num=-1, t=t)
+    postprocess3D_error(output_v[-1] - truth_v[-1], X, Y, Z, isU=False, flag=2, num=-1, t=t)
+
+
+    # for i in range(0, length, 10):
+    #     postprocess3D(output_v[i], X, Y, Z, isU=False, flag=0, num=i, t=t)
+    #     postprocess3D(truth_v[i], X, Y, Z, isU=False, flag=1, num=i, t=t)
+
+
+
+
