@@ -7,8 +7,7 @@ Neural operators, which aim to approximate mappings between infinite-dimensional
 - Despite its architectural simplicity, PMNO predictor performs fast extrapolation on arbitrary spatial resolutions, and achieves superior predictive performance across a diverse range of physical systems, including 2D linear system, modeling over irregular domain, complex-valued wave dynamics, and reaction-diffusion processes.
 
 ## Datasets
-We provide the dataset used in this projects.
-Due to the file size limit, we attach the google drive [link](https://drive.google.com/drive/folders/18ZiM3cimjfpeXvgSD0fHQOjgOnRONRpT?usp=sharing) to download the datasets.
+Due to the file size limit, We provide the datasets used in this projects in google drive [link](https://drive.google.com/drive/folders/18ZiM3cimjfpeXvgSD0fHQOjgOnRONRpT?usp=sharing).
 
 ## Pretrained Model
 We provide a pretrained model for quick evaluation and extrapolation, attached in the [link](https://drive.google.com/drive/folders/18ZiM3cimjfpeXvgSD0fHQOjgOnRONRpT?usp=sharing).
