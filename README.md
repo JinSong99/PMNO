@@ -11,7 +11,7 @@ We provide the dataset used in this projects.
 Due to the file size limit, we attach the google drive [link](https://drive.google.com/drive/folders/18ZiM3cimjfpeXvgSD0fHQOjgOnRONRpT?usp=sharing) to download the datasets.
 
 ## Pretrained Model
-We provide a pretrained model for quick evaluation and inference, attached in the [link](https://drive.google.com/drive/folders/18ZiM3cimjfpeXvgSD0fHQOjgOnRONRpT?usp=sharing).
+We provide a pretrained model for quick evaluation and extrapolation, attached in the [link](https://drive.google.com/drive/folders/18ZiM3cimjfpeXvgSD0fHQOjgOnRONRpT?usp=sharing).
 - Filename: `./model/checkpoint.pt`
 
 
